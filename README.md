@@ -3,9 +3,9 @@
 # Showcase
 ```
 AgentVelocity = 1.0f
-AgentTurnSpeed = 0.0174532925f * 45.0f
+AgentTurnSpeed = 0.0174532925f * 45.0f (45°)
 AgentSensorLength = 40.0f
-AgentSensorAngle = 0.0174532925f * 45.0f
+AgentSensorAngle = 0.0174532925f * 45.0f (45°)
 AgentSensorSize = 2
 DecayRate = 0.99f
 DiffusionSize = 1
@@ -14,9 +14,9 @@ DiffusionRate = 0.8f
 ![image](https://github.com/truew1n/Slime-Mold-Cuda/assets/48839784/b7144e51-3b7c-4608-9ba5-4db9a932df60)
 ```
 AgentVelocity = 1.0f
-AgentTurnSpeed = 0.0174532925f * 45.0f
+AgentTurnSpeed = 0.0174532925f * 45.0f (45°)
 AgentSensorLength = 4.0f
-AgentSensorAngle = 0.0174532925f * 45.0f
+AgentSensorAngle = 0.0174532925f * 45.0f (45°)
 AgentSensorSize = 1
 DecayRate = 0.91f
 DiffusionSize = 1
