@@ -23,6 +23,7 @@ DiffusionSize = 1
 DiffusionRate = 0.13f
 ```
 ![image](https://github.com/truew1n/Slime-Mold-Cuda/assets/48839784/b0608397-986a-4f9e-b2d2-ff10ea8aa038)
+```
 AgentVelocity = 1.0f
 AgentTurnSpeed = 0.0174532925f * 45.0f (45°)
 AgentSensorLength = 13.0f
@@ -31,6 +32,7 @@ AgentSensorSize 1
 DecayRate = 0.87f
 DiffusionSize 1
 DiffusionRate = 0.13f
+```
 ![image](https://github.com/truew1n/Slime-Mold-Cuda/assets/48839784/64c4052a-79b6-4440-8354-44267c80f4ac)
 ```
 AgentVelocity = 1.0f
