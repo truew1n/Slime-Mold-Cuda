@@ -1,15 +1,40 @@
+#include "cuda_runtime.h"
+#include <curand_kernel.h>
+#include "device_launch_parameters.h"
+
 #include <stdio.h>
 #include <windows.h>
+#define _USE_MATH_DEFINES
+#include <math.h>
 #include <chrono>
 #include <d3d11.h>
 
+
 #define ERROR_REGISTER_FAILED -2
 
-typedef struct cell_t {
-    double a;
-    double b;
-} cell_t;
+typedef struct FPoint2D {
+    float x;
+    float y;
+} FPoint2D;
 
+typedef struct Agent {
+    FPoint2D Position;
+    float Rotation;
+    // float PheromoneStrength;
+} Agent;
+
+typedef struct UDimension2D {
+    uint32_t Width;
+    uint32_t Height;
+} UDimension2D;
+
+typedef enum CollisionType {
+    NONE,
+    LEFT,
+    RIGHT,
+    UP,
+    DOWN
+} CollisionType;
 
 uint32_t CalcAOB(uint32_t Value, uint32_t AOT)
 {
@@ -18,140 +43,261 @@ uint32_t CalcAOB(uint32_t Value, uint32_t AOT)
 
 #define __multi__ __host__ __device__
 
-__multi__ cell_t Laplace2D(cell_t *Current, uint32_t LinearIndex, uint32_t Width)
+__device__ float Mapf(float Number, float LeftRange, float RightRange, float LeftBound, float RightBound)
 {
-    cell_t LaplaceCell = {0.0f, 0.0f};
-    
-    LaplaceCell.a += Current[LinearIndex].a * -1;
-    LaplaceCell.a += Current[LinearIndex-1].a * .2;
-    LaplaceCell.a += Current[LinearIndex+1].a * .2;
-    LaplaceCell.a += Current[LinearIndex+Width].a * .2;
-    LaplaceCell.a += Current[LinearIndex-Width].a * .2;
-    LaplaceCell.a += Current[LinearIndex-Width-1].a * .05;
-    LaplaceCell.a += Current[LinearIndex-Width+1].a * .05;
-    LaplaceCell.a += Current[LinearIndex+Width+1].a * .05;
-    LaplaceCell.a += Current[LinearIndex+Width-1].a * .05;
-
-    LaplaceCell.b += Current[LinearIndex].b * -1;
-    LaplaceCell.b += Current[LinearIndex-1].b * .2;
-    LaplaceCell.b += Current[LinearIndex+1].b * .2;
-    LaplaceCell.b += Current[LinearIndex+Width].b * .2;
-    LaplaceCell.b += Current[LinearIndex-Width].b * .2;
-    LaplaceCell.b += Current[LinearIndex-Width-1].b * .05;
-    LaplaceCell.b += Current[LinearIndex-Width+1].b * .05;
-    LaplaceCell.b += Current[LinearIndex+Width+1].b * .05;
-    LaplaceCell.b += Current[LinearIndex+Width-1].b * .05;
-
-    return LaplaceCell;
+    return (Number - LeftRange) / (RightRange - LeftRange) * (RightBound - LeftBound) + LeftBound;
 }
 
-__device__ int CurrentModel = 0;
-
-// Belousov-Zhabotinsky Reaction
-// __device__ double Da = 1.0f;
-// __device__ double Db = 0.5f;
-// __device__ double f = 0.055f;
-// __device__ double k = 0.062f;
-
-// Mitosis
-// __device__ double Da = 1.0f;
-// __device__ double Db = 0.5f;
-// __device__ double f = 0.0367f;
-// __device__ double k = 0.0649f;
-
-// Don't know
-// __device__ double Da = 1.0f;
-// __device__ double Db = 0.5f;
-// __device__ double f = 0.05364f;
-// __device__ double k = 0.02247f;
-
-// Gray-Scott Model
-// __device__ double Da = 0.16f;
-// __device__ double Db = 0.08f;
-// __device__ double f = 0.04f;
-// __device__ double k = 0.06f;
-
-// Brusselator Model
-__device__ double Da = 1.0f;
-__device__ double Db = 0.5f;
-__device__ double f = 0.04f;
-__device__ double k = 0.06f;
-
-// Seashells Model
-// __device__ double Da = 0.21f;
-// __device__ double Db = 0.11f;
-// __device__ double f = 0.014f;
-// __device__ double k = 0.054f;
-
-__global__ void LaplaceDiffuse(cell_t *Current, cell_t *Next, uint32_t Height, uint32_t Width)
+__device__ float LinInter(float x, float y, float s)
 {
-    uint32_t LinearIndex = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t X = LinearIndex % Width;
-    uint32_t Y = LinearIndex / Width;
+    return x + s * (y - x);
+}
 
-    if(X <= 0 || X >= (Width - 1) || Y <= 0 || Y >= (Height - 1)) return;
+__device__ float ToBipolar(float Unipolar)
+{
+    return (Unipolar - 0.5f) * 2.0f;
+}
 
-    double a = Current[LinearIndex].a;
-    double b = Current[LinearIndex].b;
-
-    cell_t LaplaceCell = Laplace2D(Current, LinearIndex, Width);
-
-    Next[LinearIndex].a = a + ((Da * LaplaceCell.a) - (a*b*b) + (f*(1.0f-a)));
-    Next[LinearIndex].b = b + ((Db * LaplaceCell.b) + (a*b*b) - (b*(k+f)));
+__device__ float ToDiscreteBipolar(float Unipolar)
+{
+    return (Unipolar > 0.5f ? 1.0f : -1.0f);
 }
 
 __device__ uint32_t DecodeRGB(uint8_t R, uint8_t G, uint8_t B)
 {
-    return (R << 16) + (R << 8) + B;
+    return (R << 16) + (G << 8) + B;
 }
 
-__global__ void Render(void *Display, cell_t *Next, uint32_t TotalSize)
+__device__ float AddAngles(float Angle0, float Angle1) {
+    return fmodf(((Angle0 + Angle1) + M_PI), (2*M_PI)) - M_PI;
+}
+
+__device__ float AgentVelocity = 1.0f;
+__device__ float AgentTurnSpeed = 0.0174532925f * 45.0f;
+__device__ float AgentSensorLength = 4.0f;
+__device__ float AgentSensorAngle = 0.0174532925f * 45.0f;  
+#define AgentSensorSize 1
+__device__ float DecayRate = 0.7f;
+#define DiffusionSize 1
+__device__ float DiffusionRate = 0.2f;
+
+__device__ float PheromoneFunction(float X)
+{
+    if(X > 0.5f) return X * X + 0.5f;
+    else return 0.2f * X + 0.4f;
+}
+
+__global__ void InitAgents(Agent *Agents, UDimension2D Dimension, uint32_t AgentCount)
 {
     uint32_t LinearIndex = blockIdx.x * blockDim.x + threadIdx.x;
 
-    if(LinearIndex >= TotalSize) return;
+    if(LinearIndex >= AgentCount) return;
 
-    double a = Next[LinearIndex].a;
-    double b = Next[LinearIndex].b;
-    int32_t c = (int)((a-b) * 255);
-    if(c > 255) c = 255;
-    else if(c < 0) c = 0;
-    ((uint32_t *) Display)[LinearIndex] = DecodeRGB(c, c, c);
+    curandState state;
+    curand_init(blockIdx.x * blockDim.x + threadIdx.x, 0, 0, &state);
+
+    // float RandomRadius = curand_uniform(&state) * 150 + 150;
+    float RandomRadius = curand_uniform(&state) * 300;
+    float RandomAngle = ToBipolar(curand_uniform(&state)) * M_PI;
+
+
+
+    Agents[LinearIndex].Position = {
+        (Dimension.Width / 2.0f) + (RandomRadius * cos(RandomAngle)),
+        (Dimension.Height / 2.0f) + (RandomRadius * -sin(RandomAngle))
+    };
+
+    Agents[LinearIndex].Rotation = AddAngles(RandomAngle, M_PI);
+    // Agents[LinearIndex].PheromoneStrength = PheromoneFunction(curand_uniform(&state));
 }
 
-__global__ void SwapCells(cell_t *Current, cell_t *Next, uint32_t TotalSize)
+
+__device__ void ResolveBoundCollisions(Agent *Agent, UDimension2D Dimension)
 {
-    uint32_t LinearIndex = blockIdx.x * blockDim.x + threadIdx.x;
+    FPoint2D AgentPosition = Agent->Position;
+    float AgentRotation = Agent->Rotation;
 
-    if(LinearIndex >= TotalSize) return;
+    CollisionType XCollision = CollisionType::NONE;
+    CollisionType YCollision = CollisionType::NONE;
 
-    cell_t NextCell = Next[LinearIndex];
-    Next[LinearIndex] = Current[LinearIndex];
-    Current[LinearIndex] = NextCell;
-}
 
-__global__ void Init(cell_t *Current, cell_t *Next, uint32_t Height, uint32_t Width)
-{
-    uint32_t LinearIndex = blockIdx.x * blockDim.x + threadIdx.x;
-    uint32_t X = LinearIndex % Width;
-    uint32_t Y = LinearIndex / Width;
-
-    if(X <= 0 || X >= (Width - 1) || Y <= 0 || Y >= (Height - 1)) return;
-
-    Current[LinearIndex].a = 1.0f;
-    Current[LinearIndex].b = 0.0f;
-    Next[LinearIndex].a = 1.0f;
-    Next[LinearIndex].b = 0.0f;
-
-    if(X > ((Width / 2) - 25) && X < ((Width / 2) + 25) && Y > ((Height / 2) - 25) && Y < ((Height / 2) + 25)) {
-        Current[LinearIndex].b = 1.0f;
-        Next[LinearIndex].b = 1.0f;
+    if(AgentPosition.x < 0.0f) {
+        XCollision = CollisionType::LEFT;
+    } else if(AgentPosition.x >= Dimension.Width) {
+        XCollision = CollisionType::RIGHT;
     }
 
-    if(X > ((Width / 2) - 225) && X < ((Width / 2) - 200) && Y > ((Height / 2) - 25) && Y < ((Height / 2) + 25)) {
-        Current[LinearIndex].b = 1.0f;
-        Next[LinearIndex].b = 1.0f;
+    if(AgentPosition.y < 0.0f) {
+        YCollision = CollisionType::UP;
+    } else if(AgentPosition.y >= Dimension.Height) {
+        YCollision = CollisionType::DOWN;
     }
+
+    if(XCollision == CollisionType::NONE && YCollision == CollisionType::NONE) return;
+
+    FPoint2D NewAgentPosition = AgentPosition;
+    float NewAgentRotation = 0.0f;
+
+    switch(XCollision) {
+        case CollisionType::LEFT: {
+            NewAgentPosition.x = 0.0f;
+            NewAgentRotation = M_PI - AgentRotation;
+            break;
+        }
+        case CollisionType::RIGHT: {
+            NewAgentPosition.x = Dimension.Width - 1;
+            NewAgentRotation = -AgentRotation + M_PI;
+            break;
+        }
+    }
+
+    switch(YCollision) {
+        case CollisionType::UP: {
+            NewAgentPosition.y = 0.0f;
+            NewAgentRotation = -AgentRotation;
+            break;
+        }
+        case CollisionType::DOWN: {
+            NewAgentPosition.y = Dimension.Height - 1;
+            NewAgentRotation = -AgentRotation;
+            break;
+        }
+    }
+
+    Agent->Position = NewAgentPosition;
+    Agent->Rotation = NewAgentRotation;
+}
+
+__device__ float Sense(FPoint2D AgentPosition, float AgentRotation, float Angle, void *TrailMap, UDimension2D Dimension)
+{
+    float NewAngle = AddAngles(AgentRotation, Angle);
+    FPoint2D SensePosition = {
+        AgentPosition.x + (AgentSensorLength * cos(NewAngle)),
+        AgentPosition.y + (AgentSensorLength * -sin(NewAngle))
+    };
+
+    uint32_t LinearSensePosition = (int)(SensePosition.y) * Dimension.Width + (int)(SensePosition.x);
+
+    uint32_t DimensionSize = Dimension.Width * Dimension.Height;
+
+    float Sum = 0.0f;
+    for(int32_t j = -AgentSensorSize; j <= AgentSensorSize; ++j) {
+        for(int32_t i = -AgentSensorSize; i <= AgentSensorSize; ++i) {
+            int32_t SampleLinearIndex = LinearSensePosition + (j * Dimension.Width) + i;
+            if(SampleLinearIndex >= 0 && SampleLinearIndex < DimensionSize) {
+                Sum += ((float *) TrailMap)[SampleLinearIndex];
+            }
+        }
+    }
+
+    return Sum;
+}
+
+__global__ void UpdateAgents(float DeltaTime, Agent *Agents, uint32_t AgentCount, void *TrailMap, UDimension2D Dimension)
+{
+    uint32_t LinearIndex = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if(LinearIndex >= AgentCount) return;
+
+    FPoint2D CurrentPosition = Agents[LinearIndex].Position;
+    float CurrentRotation = Agents[LinearIndex].Rotation;
+    FPoint2D NewPosition = {0};
+
+    curandState state;
+    curand_init(LinearIndex, 0, 0, &state);
+    
+    float ForwardSensorWeight = Sense(CurrentPosition, CurrentRotation, 0, TrailMap, Dimension);
+    float LeftSensorWeight = Sense(CurrentPosition, CurrentRotation, AgentSensorAngle, TrailMap, Dimension);
+    float RightSensorWeight = Sense(CurrentPosition, CurrentRotation, -AgentSensorAngle, TrailMap, Dimension);
+    
+    // printf("Forward = %f, Left = %f, Right = %f\n",
+    //     ForwardSensorWeight,
+    //     LeftSensorWeight,
+    //     RightSensorWeight
+    // );
+
+    float RandomSteerStrength = curand_uniform(&state);
+
+    if(ForwardSensorWeight > LeftSensorWeight && ForwardSensorWeight > RightSensorWeight) {
+        CurrentRotation = CurrentRotation;
+    } else if(ForwardSensorWeight < LeftSensorWeight && ForwardSensorWeight < RightSensorWeight) {
+        CurrentRotation = AddAngles(
+            CurrentRotation,
+            ToDiscreteBipolar(RandomSteerStrength) * AgentTurnSpeed
+        );
+    } else if(RightSensorWeight > LeftSensorWeight) {
+        CurrentRotation = AddAngles(
+            CurrentRotation,
+            -AgentTurnSpeed
+        );
+    } else if(LeftSensorWeight > RightSensorWeight) {
+        CurrentRotation = AddAngles(
+            CurrentRotation,
+            AgentTurnSpeed 
+        );
+    }
+
+    NewPosition.x = CurrentPosition.x + (AgentVelocity * cos(CurrentRotation));
+    NewPosition.y = CurrentPosition.y + (AgentVelocity * -sin(CurrentRotation));
+
+    Agents[LinearIndex].Position = NewPosition;
+
+    ResolveBoundCollisions(&Agents[LinearIndex], Dimension);
+}
+
+__global__ void Render(Agent *Agents, uint32_t AgentCount, void *TrailMap, UDimension2D Dimension)
+{
+    uint32_t LinearIndex = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if(LinearIndex >= AgentCount) return;
+
+    FPoint2D AgentPosition = Agents[LinearIndex].Position;
+    
+    uint32_t TrailMapIndex = (int)(AgentPosition.y) * Dimension.Width + (int)(AgentPosition.x);
+    ((float *) TrailMap)[TrailMapIndex] = 1.0f;
+    // ((float *) TrailMap)[TrailMapIndex] = Agents[LinearIndex].PheromoneStrength;
+}
+
+__global__ void ProcessTrailMap(float DeltaTime, void *TrailMap, UDimension2D Dimension)
+{
+    uint32_t LinearIndex = blockIdx.x * blockDim.x + threadIdx.x;
+
+    uint32_t X = LinearIndex % Dimension.Width;
+    uint32_t Y = LinearIndex / Dimension.Width;
+
+    if(X >= Dimension.Width || Y >= Dimension.Height) return;
+
+    float OriginalValue = ((float *) TrailMap)[LinearIndex];
+
+    float Sum = 0.0f;
+    
+    uint32_t DimensionSize = Dimension.Width * Dimension.Height;
+
+    for(int32_t j = -DiffusionSize; j <= DiffusionSize; ++j) {
+        for(int32_t i = -DiffusionSize; i <= DiffusionSize; ++i) {
+            int32_t SampleIndex = LinearIndex + (j * Dimension.Width) + i;
+            if(SampleIndex >= 0 && SampleIndex < DimensionSize) {
+                Sum += ((float *) TrailMap)[SampleIndex];
+            }
+        }
+    }
+    float Blured = Sum / ((DiffusionSize * 2 + 1) * (DiffusionSize * 2 + 1));
+
+    float Diffused = LinInter(OriginalValue, Blured, DiffusionRate);
+    float DecayedAndDiffused = Diffused * DecayRate;
+
+    ((float *) TrailMap)[LinearIndex] = DecayedAndDiffused;
+}
+
+__global__ void RenderTrailMap(void *TrailMap, void *Display, UDimension2D Dimension)
+{
+    uint32_t LinearIndex = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if(LinearIndex >= (Dimension.Width * Dimension.Height)) return;
+
+    uint8_t TrailMapColor = (uint8_t)(((float *) TrailMap)[LinearIndex] * 255);
+
+    ((uint32_t *) Display)[LinearIndex] = DecodeRGB(TrailMapColor, 0, TrailMapColor);
 }
 
 LRESULT CALLBACK WinProcedure(HWND HWnd, UINT UMsg, WPARAM WParam, LPARAM LParam);
@@ -159,9 +305,9 @@ LRESULT CALLBACK WinProcedure(HWND HWnd, UINT UMsg, WPARAM WParam, LPARAM LParam
 int main(void)
 {
     HINSTANCE WinInstance = GetModuleHandleW(NULL);
-
+    
     WNDCLASSW WinClass = {0};
-    WinClass.lpszClassName = L"Reaction-Diffusion";
+    WinClass.lpszClassName = L"Slime-Mold-Simulation";
     WinClass.hbrBackground = (HBRUSH) COLOR_WINDOW;
     WinClass.hCursor = LoadCursor(NULL, IDC_ARROW);
     WinClass.hInstance = WinInstance;
@@ -181,7 +327,7 @@ int main(void)
     AdjustWindowRect(&WindowRect, WS_OVERLAPPEDWINDOW | WS_VISIBLE, 0);
     HWND Window = CreateWindowW(
         WinClass.lpszClassName,
-        L"Reaction Diffusion Visualization",
+        L"Slime Mold Simulation",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
         CW_USEDEFAULT, CW_USEDEFAULT,
         WindowRect.right - WindowRect.left,
@@ -196,22 +342,23 @@ int main(void)
     uint32_t BitmapHeight = Height;
 
     uint32_t BytesPerPixel = 4;
-    uint32_t CellSize = sizeof(cell_t);
 
     uint32_t BitmapTotalSize = BitmapWidth * BitmapHeight;
     uint32_t DisplayTotalSize = BitmapTotalSize * BytesPerPixel;
-    uint32_t CellsTotalSize = BitmapTotalSize * CellSize;
 
     void *Display;
-    cell_t *Current;
-    cell_t *Next;
-
     cudaMallocManaged(&Display, DisplayTotalSize);
-    cudaMalloc(&Current, CellsTotalSize);
-    cudaMalloc(&Next, CellsTotalSize);
+
+    void *TrailMap;
+    cudaMalloc(&TrailMap, BitmapTotalSize * sizeof(float));
+
+    uint32_t AgentCount = 1000000;
+    Agent *Agents;
+    cudaMalloc(&Agents, AgentCount * sizeof(Agent));
 
     uint32_t AOT = 1024;
-    uint32_t AOB = CalcAOB(BitmapTotalSize, AOT);
+    uint32_t DisplayAOB = CalcAOB(BitmapTotalSize, AOT);
+    uint32_t AgentsAOB = CalcAOB(AgentCount, AOT);
 
     BITMAPINFO BitmapInfo;
     BitmapInfo.bmiHeader.biSize = sizeof(BitmapInfo.bmiHeader);
@@ -223,14 +370,21 @@ int main(void)
 
     HDC hdc = GetDC(Window);
 
-    Init<<<AOB, AOT>>>(Current, Next, BitmapHeight, BitmapWidth);
+    UDimension2D DisplayDimension = {
+        BitmapWidth,
+        BitmapHeight
+    };
 
-    uint32_t Counter = 0;
-    uint32_t CounterLimit = 20;
+    InitAgents<<<AgentsAOB, AOT>>>(Agents, DisplayDimension, AgentCount);
+    cudaDeviceSynchronize();
+    
+
+    float DeltaTime = 0.0f;
 
     MSG msg = { 0 };
     int32_t running = 1;
     while (running) {
+        clock_t start = clock();
 
         while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) {
             switch (msg.message) {
@@ -243,29 +397,32 @@ int main(void)
             DispatchMessageW(&msg);
         }
 
-        LaplaceDiffuse<<<AOB, AOT>>>(Current, Next, BitmapHeight, BitmapWidth);
+        Render<<<AgentsAOB, AOT>>>(Agents, AgentCount, TrailMap, DisplayDimension);
         cudaDeviceSynchronize();
-        Render<<<AOB, AOT>>>(Display, Next, BitmapTotalSize);
+        UpdateAgents<<<AgentsAOB, AOT>>>(DeltaTime, Agents, AgentCount, TrailMap, DisplayDimension);
         cudaDeviceSynchronize();
-        SwapCells<<<AOB, AOT>>>(Current, Next, BitmapTotalSize);
+        ProcessTrailMap<<<DisplayAOB, AOT>>>(DeltaTime, TrailMap, DisplayDimension);
         cudaDeviceSynchronize();
+        RenderTrailMap<<<DisplayAOB, AOT>>>(TrailMap, Display, DisplayDimension);
+        cudaDeviceSynchronize();
+        
+        StretchDIBits(
+            hdc, 0, 0,
+            BitmapWidth, BitmapHeight,
+            0, 0,
+            BitmapWidth, BitmapHeight,
+            Display, &BitmapInfo,
+            DIB_RGB_COLORS,
+            SRCCOPY
+        );
 
-        if(Counter == CounterLimit) {
-            StretchDIBits(
-                hdc, 0, 0,
-                BitmapWidth, BitmapHeight,
-                0, 0,
-                BitmapWidth, BitmapHeight,
-                Display, &BitmapInfo,
-                DIB_RGB_COLORS,
-                SRCCOPY
-            );
-            Counter = 0;
-        }
-        Counter++;
+        DeltaTime = (float)(clock() - start) / CLOCKS_PER_SEC;
+        // printf("fps = %f\n", 1.0f / DeltaTime);
     }
 
     cudaFree(Display);
+    cudaFree(Agents);
+    cudaFree(TrailMap);
     return 0;
 }
 
